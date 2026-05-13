@@ -1,104 +1,173 @@
-const express = require('express')
-const cors = require('cors')
-const session = require('express-session')
-const { ClasseViva } = require('classeviva-apiv2')
+const express    = require('express')
+const cors       = require('cors')
+const session    = require('express-session')
+const ClasseViva = require('./Classeviva')   // export diretto: module.exports = ClasseViva
 
 const app = express()
 
-// ===== Middleware base =====
-app.use(cors({
-  origin: 'http://localhost:5173',
-  credentials: true
-}))
+// ─────────────────────────────────────────────
+//  LOGGING
+// ─────────────────────────────────────────────
 
+function log(level, ...args) {
+  const ts     = new Date().toISOString()
+  const prefix = { info: '📘', warn: '⚠️ ', error: '❌' }[level] ?? '  '
+  console[level === 'error' ? 'error' : 'log'](`[${ts}] ${prefix}`, ...args)
+}
+
+function logReq(req, res, next) {
+  const start = Date.now()
+  res.on('finish', () => {
+    const ms    = Date.now() - start
+    const color = res.statusCode >= 400 ? '\x1b[31m' : '\x1b[32m'
+    log('info', `${color}${req.method} ${req.path} → ${res.statusCode}\x1b[0m (${ms}ms)`)
+  })
+  next()
+}
+
+// ─────────────────────────────────────────────
+//  MIDDLEWARE
+// ─────────────────────────────────────────────
+
+app.use(cors({ origin: 'http://localhost:5173', credentials: true }))
 app.use(express.json())
+app.use(logReq)
 
 app.use(session({
-  secret: 'il-gatto-di-mia-nonna-non-esiste',
-  resave: false,
+  secret:            'il-gatto-di-mia-nonna-non-esiste',
+  resave:            false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    maxAge: 1000 * 60 * 60 * 2 // 2 ore
+    maxAge:   1000 * 60 * 60 * 2   // 2 ore
   }
 }))
 
+// ─────────────────────────────────────────────
+//  CACHE SESSIONE CLASSEVIVA
+//
+//  Il PHPSESSID di ClasseViva viene salvato in
+//  req.session.cvSessionId: ogni request riusa la
+//  sessione esistente senza rifare il login HTTP.
+// ─────────────────────────────────────────────
+
 async function getCV(req) {
-  const { user, pass } = req.session
+  const { user, pass, cvSessionId } = req.session
   if (!user || !pass) return null
 
+  if (cvSessionId) {
+    log('info', `Riuso sessione CV cached per ${user}`)
+    const cv = new ClasseViva(user, pass)
+    cv.sessionid = cvSessionId
+    return cv
+  }
+
+  log('info', `Nessuna sessione cached, nuovo login per ${user}`)
   const cv = new ClasseViva(user, pass)
   await cv.login()
+  req.session.cvSessionId = cv.sessionid
   return cv
 }
 
 async function requireCV(req, res, next) {
   try {
     const cv = await getCV(req)
-    if (!cv) return res.status(401).json({ errore: 'Non loggato' })
-
+    if (!cv) return res.status(401).json({ errore: 'Non autenticato' })
     req.cv = cv
     next()
   } catch (err) {
-    res.status(401).json({ errore: 'Sessione scaduta' })
+    log('error', 'requireCV:', err.message)
+    req.session.cvSessionId = null
+    res.status(401).json({ errore: 'Sessione ClasseViva scaduta, effettua di nuovo il login' })
   }
 }
 
-app.post('/api/login', async (req, res) => {
-  try {
-    const { user, pass } = req.body
+// Wrapper async: centralizza try/catch e risposta JSON
+function handler(fn) {
+  return async (req, res) => {
+    try {
+      const data = await fn(req, res)
+      if (data !== undefined) res.json(data)
+    } catch (err) {
+      log('error', `${req.method} ${req.path}:`, err.message)
 
-    const cv = new ClasseViva(user, pass)
-    await cv.login()
+      if (/scadut|expired|session/i.test(err.message)) {
+        req.session.cvSessionId = null
+        return res.status(401).json({ errore: 'Sessione scaduta, effettua di nuovo il login' })
+      }
 
-    // Salviamo SOLO dati serializzabili
-    req.session.user = user
-    req.session.pass = pass
-
-    res.json({ ok: true })
-  } catch (err) {
-    res.status(401).json({ errore: err.message })
+      res.status(500).json({ errore: 'Errore interno del server', dettaglio: err.message })
+    }
   }
-})
+}
+
+// ─────────────────────────────────────────────
+//  AUTH
+// ─────────────────────────────────────────────
+
+app.post('/api/login', handler(async (req, res) => {
+  const { user, pass } = req.body
+  if (!user || !pass) {
+    res.status(400).json({ errore: 'Credenziali mancanti' })
+    return
+  }
+
+  log('info', `Tentativo login per: ${user}`)
+  const cv = await ClasseViva.establishSession(user, pass)
+
+  req.session.user        = user
+  req.session.pass        = pass
+  req.session.cvSessionId = cv.sessionid
+
+  log('info', `Login riuscito per: ${user}`)
+  res.json({ ok: true })
+}))
 
 app.post('/api/logout', (req, res) => {
-  req.session.destroy(() => {
+  const user = req.session.user ?? 'sconosciuto'
+  req.session.destroy(err => {
+    if (err) {
+      log('error', 'Logout:', err.message)
+      return res.status(500).json({ errore: 'Errore durante il logout' })
+    }
+    log('info', `Logout: ${user}`)
     res.json({ ok: true })
   })
 })
 
-app.get('/api/profilo', requireCV, async (req, res) => {
-  res.json(await req.cv.getProfile())
+// ─────────────────────────────────────────────
+//  ROUTE PROTETTE
+// ─────────────────────────────────────────────
+
+app.get('/api/profilo',   requireCV, handler(req => req.cv.getProfile()))
+app.get('/api/voti',      requireCV, handler(req => req.cv.getGrades()))
+app.get('/api/assenze',   requireCV, handler(req => req.cv.getAbsences()))
+app.get('/api/ritardi',   requireCV, handler(req => req.cv.getDelays()))
+app.get('/api/note',      requireCV, handler(req => req.cv.getNotes()))
+app.get('/api/argomenti', requireCV, handler(req => req.cv.getLessons()))
+app.get('/api/compiti',   requireCV, handler(req => req.cv.getHomework()))
+app.get('/api/orario',    requireCV, handler(req => req.cv.getTimetable()))
+
+// ─────────────────────────────────────────────
+//  404 + ERRORI GLOBALI
+// ─────────────────────────────────────────────
+
+app.use((req, res) => {
+  res.status(404).json({ errore: `Route non trovata: ${req.method} ${req.path}` })
 })
 
-app.get('/api/voti', requireCV, async (req, res) => {
-  res.json(await req.cv.getGrades())
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  log('error', 'Errore non gestito:', err.message)
+  res.status(500).json({ errore: 'Errore interno del server' })
 })
 
-app.get('/api/assenze', requireCV, async (req, res) => {
-  res.json(await req.cv.getAbsences())
-})
+// ─────────────────────────────────────────────
+//  AVVIO
+// ─────────────────────────────────────────────
 
-app.get('/api/ritardi', requireCV, async (req, res) => {
-  res.json(await req.cv.getDelays())
-})
+const PORT = process.env.PORT ?? 3004
 
-app.get('/api/note', requireCV, async (req, res) => {
-  res.json(await req.cv.getNotes())
-})
-
-app.get('/api/argomenti', requireCV, async (req, res) => {
-  res.json(await req.cv.getLessons())
-})
-
-app.get('/api/compiti', requireCV, async (req, res) => {
-  res.json(await req.cv.getHomework())
-})
-
-app.get('/api/orario', requireCV, async (req, res) => {
-  res.json(await req.cv.getTimetable())
-})
-
-app.listen(3000, () => {
-  console.log('Server pronto su http://localhost:3000')
+app.listen(PORT, () => {
+  log('info', `Server pronto su http://localhost:${PORT}`)
 })
