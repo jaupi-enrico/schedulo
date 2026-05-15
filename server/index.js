@@ -5,6 +5,7 @@ const lusca      = require('lusca')
 const ClasseViva = require('./Classeviva')   // export diretto: module.exports = ClasseViva
 
 const app = express()
+app.set('trust proxy', 1)
 
 // ─────────────────────────────────────────────
 //  LOGGING
@@ -40,6 +41,8 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
+    secure:   process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
     maxAge:   1000 * 60 * 60 * 2   // 2 ore
   }
 }))
