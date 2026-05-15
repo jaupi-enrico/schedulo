@@ -1,5 +1,5 @@
 export async function api(path, options = {}) {
-  const res = await fetch(`http://localhost:3004${path}`, {
+  const res = await fetch(path, {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json'
