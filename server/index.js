@@ -1,6 +1,7 @@
 const express    = require('express')
 const cors       = require('cors')
 const session    = require('express-session')
+const lusca      = require('lusca')
 const ClasseViva = require('./Classeviva')   // export diretto: module.exports = ClasseViva
 
 const app = express()
@@ -42,6 +43,7 @@ app.use(session({
     maxAge:   1000 * 60 * 60 * 2   // 2 ore
   }
 }))
+app.use(lusca.csrf())
 
 // ─────────────────────────────────────────────
 //  CACHE SESSIONE CLASSEVIVA
@@ -104,6 +106,10 @@ function handler(fn) {
 // ─────────────────────────────────────────────
 //  AUTH
 // ─────────────────────────────────────────────
+
+app.get('/api/csrf-token', (req, res) => {
+  res.json({ csrfToken: req.csrfToken() })
+})
 
 app.post('/api/login', handler(async (req, res) => {
   const { user, pass } = req.body
